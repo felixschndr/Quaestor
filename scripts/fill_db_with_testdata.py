@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import select
@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT))
 
 from source.backend.bank_handlers import BankProvider  # noqa: E402
 from source.backend.db import SessionLocal  # noqa: E402
+from source.backend.models.account import Account  # noqa: E402
+from source.backend.models.account_group import AccountGroup  # noqa: E402
 from source.backend.models.transaction_category import TransactionCategory  # noqa: E402
 from source.backend.models.transaction_type import TransactionType  # noqa: E402
 from source.backend.models.user import User  # noqa: E402
@@ -98,6 +100,16 @@ def _transactions_for(account_index: int) -> list[dict]:
                 "category": TransactionCategory.ONLINE_SHOPPING,
             }
         )
+    transactions.append(
+        {
+            "amount": -780.00,
+            "purpose": "Rent",
+            "other_party": "Landlord GmbH",
+            "date": TODAY + timedelta(days=3),
+            "transaction_type": TransactionType.OUTGOING,
+            "category": TransactionCategory.RENT,
+        }
+    )
     return transactions
 
 
@@ -112,6 +124,33 @@ def _delete_existing_demo_user(db_session: Session) -> None:
         db_session.flush()
 
 
+def _create_account_groups(session: Session, user_id: int, accounts: list[Account]) -> None:
+    everyday = AccountGroup(user_id=user_id, name="Everyday", position=0)
+    savings = AccountGroup(user_id=user_id, name="Savings", position=1)
+    investments = AccountGroup(user_id=user_id, name="Investments", position=2)
+    session.add_all([everyday, savings, investments])
+    session.flush()
+
+    group_by_bank: dict[str, AccountGroup] = {
+        BankProvider.ING.value: everyday,
+        BankProvider.DKB.value: everyday,
+        BankProvider.SPARKASSE.value: everyday,
+        BankProvider.FIN4U.value: savings,
+        BankProvider.DFS.value: investments,
+        BankProvider.TRADE_REPUBLIC.value: investments,
+        # BankProvider.MANUAL is intentionally absent → stays ungrouped.
+    }
+
+    position_in_group: dict[int, int] = {}
+    for account in accounts:
+        group = group_by_bank.get(account.credential.bank.value)
+        if group is None:
+            continue
+        account.group_id = group.id
+        account.position = position_in_group.get(group.id, 0)
+        position_in_group[group.id] = account.position + 1
+
+
 def fill_db_with_testdata() -> None:
     migrations.upgrade_to_head()
     with SessionLocal() as session:
@@ -122,21 +161,46 @@ def fill_db_with_testdata() -> None:
             display_name=DISPLAY_NAME,
             password_hash=hash_password(VALID_PASSWORD),
         )
+
+        last_synced = datetime.now() - timedelta(hours=2)
+
+        _display_names: dict[int, str] = {
+            0: "Salary Account",
+            2: "Daily Allowance",
+            5: "Vacation",
+        }
+
+        all_accounts: list[Account] = []
         account_counter = 0
         for bank in BankProvider:
-            credential = make_credential(session, user_id=user.id, bank=bank)
+            credential = make_credential(
+                session,
+                user_id=user.id,
+                bank=bank,
+                last_fetching_timestamp=last_synced,
+                requires_two_factor_authentication=bank in {BankProvider.ING, BankProvider.TRADE_REPUBLIC},
+            )
             for index in range(2):
+                balance_factor = 50 if account_counter == 3 else 100
+                is_hidden = account_counter == 13
                 account = make_account(
                     session,
                     credential_id=credential.id,
                     name=_account_name(bank, index),
+                    display_name=_display_names.get(account_counter),
                     balance=1000.0 + 250.0 * account_counter,
+                    balance_factor=balance_factor,
+                    is_hidden=is_hidden,
                 )
                 for transaction_data in _transactions_for(account_counter):
                     make_transaction(session, account_id=account.id, **transaction_data)
+                account.update_balance_at_date()
+                all_accounts.append(account)
                 account_counter += 1
+
+        _create_account_groups(session=session, user_id=user.id, accounts=all_accounts)
         session.commit()
-    print(f"Seeded demo data: user '{USER_NAME}' / password '{VALID_PASSWORD}' with {account_counter} accounts.")
+    print(f"Created demo data: user '{USER_NAME}' / password '{VALID_PASSWORD}' " f"with {account_counter} accounts.")
 
 
 if __name__ == "__main__":
